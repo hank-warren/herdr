@@ -86,6 +86,8 @@ impl std::fmt::Display for Version {
 #[derive(Deserialize)]
 struct UpdateManifest {
     version: String,
+    /// Thin-client protocol spoken by this release, when advertised by the manifest.
+    protocol: Option<u32>,
     notes: String,
     assets: BTreeMap<String, String>,
 }
@@ -105,8 +107,10 @@ impl UpdateManifest {
 // ---------------------------------------------------------------------------
 
 /// Information about an available update.
+#[derive(Debug, Clone)]
 struct ReleaseInfo {
     version: Version,
+    target_protocol: Option<u32>,
     download_url: String,
     notes_body: String,
 }
@@ -155,6 +159,7 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
 
     Ok(Some(ReleaseInfo {
         version: latest,
+        target_protocol: manifest.protocol,
         download_url,
         notes_body,
     }))
@@ -241,6 +246,234 @@ fn api_server_is_running_at(socket_path: &Path) -> bool {
 
 fn api_server_is_running() -> bool {
     api_server_is_running_at(&crate::api::socket_path())
+}
+
+fn client_protocol_server_is_running_at(socket_path: &Path) -> bool {
+    if !socket_path.exists() {
+        return false;
+    }
+
+    UnixStream::connect(socket_path).is_ok()
+}
+
+fn client_protocol_server_is_running() -> bool {
+    client_protocol_server_is_running_at(&crate::server::headless::client_socket_path())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningServerInfo {
+    version: Option<String>,
+    protocol: Option<u32>,
+}
+
+fn read_running_server_info_at(
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<Option<RunningServerInfo>, String> {
+    use crate::api::schema::{Method, PingParams, Request};
+
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!(
+                "failed to connect to running server on {}: {err}",
+                socket_path.display()
+            ));
+        }
+    };
+
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("failed to set server status write timeout: {e}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("failed to set server status read timeout: {e}"))?;
+
+    let request = Request {
+        id: "update:server:status".into(),
+        method: Method::Ping(PingParams::default()),
+    };
+    stream
+        .write_all(
+            serde_json::to_string(&request)
+                .map_err(|e| e.to_string())?
+                .as_bytes(),
+        )
+        .map_err(|e| format!("failed to send server status request: {e}"))?;
+    stream
+        .write_all(b"\n")
+        .map_err(|e| format!("failed to finish server status request: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("failed to flush server status request: {e}"))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read server status response: {e}"))?;
+    if read == 0 || line.trim().is_empty() {
+        return Err("empty server status response".into());
+    }
+
+    let response: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| format!("invalid server status response: {e}"))?;
+    if let Some(error) = response.get("error") {
+        return Err(format!("server status request failed: {error}"));
+    }
+
+    let result = &response["result"];
+    Ok(Some(RunningServerInfo {
+        version: result
+            .get("version")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        protocol: result
+            .get("protocol")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+    }))
+}
+
+fn read_running_server_info() -> Result<Option<RunningServerInfo>, String> {
+    read_running_server_info_at(&crate::api::socket_path(), SERVER_STOP_RESPONSE_TIMEOUT)
+}
+
+fn protocol_label(protocol: Option<u32>) -> String {
+    protocol
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn version_label(version: Option<&str>) -> &str {
+    version.unwrap_or("unknown")
+}
+
+fn update_requires_server_stop(server: &RunningServerInfo, release: &ReleaseInfo) -> bool {
+    match (server.protocol, release.target_protocol) {
+        (Some(server_protocol), Some(target_protocol)) => server_protocol != target_protocol,
+        _ => true,
+    }
+}
+
+fn parse_stop_server_before_update_response(input: &str) -> Option<bool> {
+    let trimmed = input.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "" | "n" | "no" => Some(false),
+        "y" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+fn prompt_to_stop_server_before_update(
+    server: &RunningServerInfo,
+    release: &ReleaseInfo,
+    requires_stop: bool,
+) -> Result<bool, String> {
+    if !io::stdin().is_terminal() {
+        if requires_stop {
+            return Err(format!(
+                "a herdr server is running and updating to v{} requires stopping it; run `herdr server stop`, then run `herdr update` again",
+                release.version
+            ));
+        }
+
+        eprintln!(
+            "a herdr server is running. updating the binary will not affect that server until it restarts."
+        );
+        return Ok(false);
+    }
+
+    eprintln!("a herdr server is currently running:");
+    eprintln!(
+        "  server: v{} protocol {}",
+        version_label(server.version.as_deref()),
+        protocol_label(server.protocol)
+    );
+    eprintln!(
+        "  update: v{} protocol {}",
+        release.version,
+        protocol_label(release.target_protocol)
+    );
+    eprintln!();
+
+    if requires_stop {
+        eprintln!(
+            "this update changes the herdr client/server protocol. the running server must be stopped before the new client can attach."
+        );
+        eprintln!("stopping the server will end the current herdr session and its panes.");
+    } else {
+        eprintln!("updating the binary will not affect the running server until it restarts.");
+    }
+
+    loop {
+        let prompt = if requires_stop {
+            "stop the server and continue updating? [y/N] "
+        } else {
+            "stop the server before updating? [y/N] "
+        };
+        eprint!("{prompt}");
+        io::stderr()
+            .flush()
+            .map_err(|e| format!("failed to flush prompt: {e}"))?;
+
+        let mut input = String::new();
+        let read = io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| format!("failed to read prompt response: {e}"))?;
+        if read == 0 {
+            return Ok(false);
+        }
+
+        if let Some(answer) = parse_stop_server_before_update_response(&input) {
+            return Ok(answer);
+        }
+
+        eprintln!("please answer y or n");
+    }
+}
+
+fn preflight_running_server_for_update(release: &ReleaseInfo) -> Result<bool, String> {
+    let Some(server) = read_running_server_info()? else {
+        if client_protocol_server_is_running() {
+            return Err(
+                "a herdr server is listening, but its status API is unavailable; try `herdr server stop`, or stop the old server process manually, then run `herdr update` again"
+                    .to_string(),
+            );
+        }
+        return Ok(false);
+    };
+
+    let requires_stop = update_requires_server_stop(&server, release);
+    let stop_server = prompt_to_stop_server_before_update(&server, release, requires_stop)?;
+    if !stop_server {
+        if requires_stop {
+            return Err(
+                "update cancelled; stop the running herdr server with `herdr server stop`, then run `herdr update` again"
+                    .to_string(),
+            );
+        }
+        return Ok(false);
+    }
+
+    stop_server_via_api()?;
+    wait_for_server_shutdown(SERVER_SHUTDOWN_CONFIRM_TIMEOUT)?;
+    eprintln!("stopped the running herdr server.");
+    Ok(true)
 }
 
 fn stop_server_via_api_at(socket_path: &Path, timeout: Duration) -> Result<(), String> {
@@ -339,45 +572,6 @@ fn wait_for_server_shutdown(timeout: Duration) -> Result<(), String> {
     wait_for_server_shutdown_at(&crate::api::socket_path(), timeout)
 }
 
-fn parse_stop_server_response(input: &str) -> Option<bool> {
-    let trimmed = input.trim().to_ascii_lowercase();
-    match trimmed.as_str() {
-        "" | "y" | "yes" => Some(true),
-        "n" | "no" => Some(false),
-        _ => None,
-    }
-}
-
-fn prompt_to_stop_running_server() -> Result<bool, String> {
-    if !io::stdin().is_terminal() {
-        eprintln!(
-            "a herdr server is still running on the old version. rerun `herdr update` interactively or stop it later with `herdr server stop`."
-        );
-        return Ok(false);
-    }
-
-    loop {
-        eprint!("a herdr server is still running on the old version. stop it now to apply the update? [Y/n] ");
-        io::stderr()
-            .flush()
-            .map_err(|e| format!("failed to flush prompt: {e}"))?;
-
-        let mut input = String::new();
-        let read = io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| format!("failed to read prompt response: {e}"))?;
-        if read == 0 {
-            return Ok(false);
-        }
-
-        if let Some(answer) = parse_stop_server_response(&input) {
-            return Ok(answer);
-        }
-
-        eprintln!("please answer y or n");
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -400,6 +594,8 @@ pub fn self_update() -> Result<Version, String> {
         }
     };
 
+    let stopped_server = preflight_running_server_for_update(&release)?;
+
     eprintln!("downloading v{}...", release.version);
     if let Err(e) =
         crate::release_notes::save_pending(&release.version.to_string(), &release.notes_body)
@@ -409,26 +605,12 @@ pub fn self_update() -> Result<Version, String> {
     download_and_install(&release)?;
     eprintln!("updated to v{}", release.version);
 
-    if api_server_is_running() {
-        if prompt_to_stop_running_server()? {
-            match stop_server_via_api() {
-                Ok(()) => match wait_for_server_shutdown(SERVER_SHUTDOWN_CONFIRM_TIMEOUT) {
-                    Ok(()) => eprintln!("stopped the running herdr server. run herdr again."),
-                    Err(err) => eprintln!(
-                        "update installed, but {err}\ntry `herdr server stop` from another shell, then run `herdr` again."
-                    ),
-                },
-                Err(err) => eprintln!(
-                    "update installed, but failed to stop the running server: {err}\ntry `herdr server stop` from another shell, then run `herdr` again."
-                ),
-            }
-        } else {
-            eprintln!(
-                "update installed, but the old server is still running. restart it later to use the new version."
-            );
-        }
+    if stopped_server {
+        eprintln!("run herdr again to start the updated server.");
+    } else if api_server_is_running() {
+        eprintln!("the running herdr server will use the new version after it restarts.");
     } else {
-        eprintln!("update installed. run herdr again.");
+        eprintln!("run herdr again.");
     }
 
     Ok(release.version)
@@ -619,14 +801,58 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_server_response_defaults_yes_for_blank() {
-        assert_eq!(parse_stop_server_response(""), Some(true));
-        assert_eq!(parse_stop_server_response("\n"), Some(true));
-        assert_eq!(parse_stop_server_response("y"), Some(true));
-        assert_eq!(parse_stop_server_response("yes"), Some(true));
-        assert_eq!(parse_stop_server_response("n"), Some(false));
-        assert_eq!(parse_stop_server_response("no"), Some(false));
-        assert_eq!(parse_stop_server_response("later"), None);
+    fn parse_stop_server_before_update_response_defaults_no_for_blank() {
+        assert_eq!(parse_stop_server_before_update_response(""), Some(false));
+        assert_eq!(parse_stop_server_before_update_response("\n"), Some(false));
+        assert_eq!(parse_stop_server_before_update_response("n"), Some(false));
+        assert_eq!(parse_stop_server_before_update_response("no"), Some(false));
+        assert_eq!(parse_stop_server_before_update_response("y"), Some(true));
+        assert_eq!(parse_stop_server_before_update_response("yes"), Some(true));
+        assert_eq!(parse_stop_server_before_update_response("later"), None);
+    }
+
+    #[test]
+    fn update_requires_server_stop_when_target_protocol_differs_or_unknown() {
+        let server = RunningServerInfo {
+            version: Some("0.5.5".to_string()),
+            protocol: Some(2),
+        };
+        let compatible_release = ReleaseInfo {
+            version: Version::parse("0.5.6").unwrap(),
+            target_protocol: Some(2),
+            download_url: "https://example.com/herdr".to_string(),
+            notes_body: "### Changed\n- One".to_string(),
+        };
+        let incompatible_release = ReleaseInfo {
+            target_protocol: Some(4),
+            ..compatible_release.clone()
+        };
+        let unknown_release = ReleaseInfo {
+            target_protocol: None,
+            ..compatible_release.clone()
+        };
+
+        assert!(!update_requires_server_stop(&server, &compatible_release));
+        assert!(update_requires_server_stop(&server, &incompatible_release));
+        assert!(update_requires_server_stop(&server, &unknown_release));
+    }
+
+    #[test]
+    fn client_protocol_server_is_running_at_detects_live_socket() {
+        let socket_path = unique_test_socket_path("client-live");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        assert!(client_protocol_server_is_running_at(&socket_path));
+
+        drop(listener);
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[test]
+    fn client_protocol_server_is_running_at_ignores_missing_socket() {
+        let socket_path = unique_test_socket_path("client-missing");
+
+        assert!(!client_protocol_server_is_running_at(&socket_path));
     }
 
     #[test]
@@ -750,6 +976,7 @@ mod tests {
     fn update_manifest_deserializes() {
         let json = "{\n\
             \"version\": \"0.2.0\",\n\
+            \"protocol\": 4,\n\
             \"notes\": \"### Changed\\n- One\",\n\
             \"assets\": {\n\
                 \"linux-x86_64\": \"https://example.com/herdr-linux-x86_64\",\n\
@@ -758,6 +985,7 @@ mod tests {
         }";
         let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.version, "0.2.0");
+        assert_eq!(manifest.protocol, Some(4));
         assert_eq!(manifest.assets.len(), 2);
         assert_eq!(manifest.notes_body(), "### Changed\n- One");
         assert_eq!(
@@ -784,6 +1012,10 @@ mod tests {
             .expect("website/latest.json should match updater schema");
 
         assert!(!manifest.notes_body().is_empty());
+        assert_eq!(
+            manifest.protocol,
+            Some(crate::server::protocol::PROTOCOL_VERSION)
+        );
         assert_eq!(manifest.assets.len(), 4);
 
         for target in [

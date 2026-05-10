@@ -8,7 +8,7 @@
 //! The `--no-session` flag bypasses server/client entirely and runs monolithically
 //! (escape hatch for users who want the traditional single-process behavior).
 
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -27,6 +27,9 @@ const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Poll interval when waiting for the server socket to appear.
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Timeout for checking the stable JSON API before attaching to the binary protocol socket.
+const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // Server detection
 // ---------------------------------------------------------------------------
@@ -41,6 +44,12 @@ const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 #[allow(dead_code)] // Public API for external use and testing
 pub fn is_server_listening() -> bool {
     is_server_listening_at(&client_socket_path())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerStatus {
+    version: Option<String>,
+    protocol: Option<u32>,
 }
 
 /// Checks whether a herdr server is listening at a specific socket path.
@@ -75,6 +84,99 @@ fn is_server_listening_at(socket_path: &Path) -> bool {
             false
         }
     }
+}
+
+fn read_server_status_at(
+    socket_path: &Path,
+    timeout: Duration,
+) -> io::Result<Option<ServerStatus>> {
+    use crate::api::schema::{Method, PingParams, Request};
+
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::NotFound
+                    | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
+
+    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(timeout))?;
+
+    let request = Request {
+        id: "autodetect:server:status".into(),
+        method: Method::Ping(PingParams::default()),
+    };
+    stream.write_all(serde_json::to_string(&request)?.as_bytes())?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let read = reader.read_line(&mut line)?;
+    if read == 0 || line.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty server status response",
+        ));
+    }
+
+    let response: serde_json::Value = serde_json::from_str(&line).map_err(io::Error::other)?;
+    if response.get("error").is_some() {
+        return Err(io::Error::other(format!(
+            "server status request failed: {response}"
+        )));
+    }
+
+    let result = &response["result"];
+    Ok(Some(ServerStatus {
+        version: result
+            .get("version")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned),
+        protocol: result
+            .get("protocol")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok()),
+    }))
+}
+
+fn read_server_status() -> io::Result<Option<ServerStatus>> {
+    read_server_status_at(&crate::api::socket_path(), STATUS_REQUEST_TIMEOUT)
+}
+
+fn validate_running_server_compatibility() -> io::Result<()> {
+    let Some(status) = read_server_status()? else {
+        return Err(io::Error::other(
+            "a herdr server is listening, but its status API is unavailable. Try `herdr server stop`; if that fails, stop the old server process manually, then run `herdr` again.",
+        ));
+    };
+
+    if status.protocol == Some(crate::server::protocol::PROTOCOL_VERSION) {
+        return Ok(());
+    }
+
+    Err(io::Error::other(format!(
+        "herdr server is running from v{} / protocol {}, but this client is v{} / protocol {}.\nStop the old server with `herdr server stop`, then run `herdr` again.",
+        status.version.as_deref().unwrap_or("unknown"),
+        status
+            .protocol
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        env!("CARGO_PKG_VERSION"),
+        crate::server::protocol::PROTOCOL_VERSION
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +285,7 @@ pub fn auto_detect_launch() -> io::Result<()> {
     info!(path = %socket_path.display(), "auto-detect launch starting");
 
     if is_server_listening_at(&socket_path) {
+        validate_running_server_compatibility()?;
         info!("server already running, attaching as client");
     } else {
         info!("no server running, spawning server daemon");
@@ -343,6 +446,54 @@ mod tests {
         // Wait with a generous timeout — should succeed.
         let result = wait_for_server_socket(&path, Duration::from_secs(2));
         assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_server_status_at_reads_ping_response() {
+        let dir = unique_test_dir("status");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("ping"));
+            stream
+                .write_all(
+                    b"{\"id\":\"autodetect:server:status\",\"result\":{\"type\":\"pong\",\"version\":\"0.5.5\",\"protocol\":2}}\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let status = read_server_status_at(&path, Duration::from_millis(200))
+            .unwrap()
+            .unwrap();
+        let _ = handle.join();
+        assert_eq!(status.version.as_deref(), Some("0.5.5"));
+        assert_eq!(status.protocol, Some(2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_running_server_compatibility_fails_when_status_api_missing() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_dir("missing-api");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api.sock");
+        std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &path);
+
+        let err = validate_running_server_compatibility().unwrap_err();
+
+        assert!(
+            err.to_string().contains("status API is unavailable"),
+            "unexpected error: {err}"
+        );
+        std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

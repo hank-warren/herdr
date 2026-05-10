@@ -17,6 +17,7 @@ SECTION_RE = re.compile(r"^##\s+(?:\[(?P<bracketed>[^\]]+)\]|(?P<plain>.+?))\s*$
 VERSION_WITH_DATE_RE = re.compile(r"^(?P<version>.+?)\s+-\s+\d{4}-\d{2}-\d{2}$")
 DEFAULT_RELEASE_REPO = "ogulcancelik/herdr"
 DEFAULT_LATEST_JSON_PATH = Path("website/latest.json")
+PROTOCOL_SOURCE_PATH = Path("src/server/protocol.rs")
 ASSET_TARGETS = (
     "linux-x86_64",
     "linux-aarch64",
@@ -124,11 +125,24 @@ def prepare_release(text: str, version: str, release_date: str) -> str:
     return rebuilt + "\n"
 
 
-def build_latest_json(version: str, notes: str, assets: dict[str, str]) -> str:
+def read_protocol_version(source_path: Path = PROTOCOL_SOURCE_PATH) -> int:
+    content = source_path.read_text(encoding="utf-8")
+    match = re.search(r"pub const PROTOCOL_VERSION: u32 = (\d+);", content)
+    if not match:
+        raise ChangelogError(f"could not read PROTOCOL_VERSION from {source_path}")
+    return int(match.group(1))
+
+
+def build_latest_json(
+    version: str, notes: str, assets: dict[str, str], protocol: int | None = None
+) -> str:
     normalized_version = normalize_version(version)
     normalized_notes = notes.strip()
     if not normalized_notes:
         raise ChangelogError("release notes are empty")
+
+    if protocol is None:
+        protocol = read_protocol_version()
 
     missing_targets = [target for target in ASSET_TARGETS if target not in assets]
     if missing_targets:
@@ -139,6 +153,7 @@ def build_latest_json(version: str, notes: str, assets: dict[str, str]) -> str:
     return json.dumps(
         {
             "version": normalized_version,
+            "protocol": protocol,
             "notes": normalized_notes,
             "assets": ordered_assets,
         },
@@ -194,6 +209,7 @@ def manifest_from_release_payload(payload: dict[str, Any], version: str) -> dict
 
     return {
         "version": normalized_version,
+        "protocol": read_protocol_version(),
         "notes": notes,
         "assets": manifest_assets,
     }
@@ -208,6 +224,10 @@ def canonicalize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any
     if not isinstance(notes, str) or not notes.strip():
         raise ChangelogError(f"{label} is missing non-empty release notes")
 
+    protocol = manifest.get("protocol")
+    if not isinstance(protocol, int):
+        raise ChangelogError(f"{label} is missing an integer protocol")
+
     assets = manifest.get("assets")
     if not isinstance(assets, dict):
         raise ChangelogError(f"{label} is missing an assets object")
@@ -221,6 +241,7 @@ def canonicalize_manifest(manifest: dict[str, Any], label: str) -> dict[str, Any
 
     return {
         "version": normalize_version(version),
+        "protocol": protocol,
         "notes": notes.strip(),
         "assets": normalized_assets,
     }

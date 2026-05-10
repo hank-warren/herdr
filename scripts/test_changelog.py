@@ -13,6 +13,7 @@ from scripts.changelog import (
     extract_section_body,
     manifest_from_release_payload,
     prepare_release,
+    read_protocol_version,
 )
 
 
@@ -50,6 +51,7 @@ class ChangelogScriptTests(unittest.TestCase):
             )
         )
 
+        self.assertEqual(manifest["protocol"], read_protocol_version())
         self.assertEqual(manifest["notes"], "### Fixed\n- One")
 
     def test_build_latest_json_embeds_notes_and_release_assets(self) -> None:
@@ -62,6 +64,7 @@ class ChangelogScriptTests(unittest.TestCase):
         )
 
         self.assertEqual(manifest["version"], "0.1.1")
+        self.assertEqual(manifest["protocol"], read_protocol_version())
         self.assertEqual(manifest["notes"], "### Fixed\n- Smoothed Claude flapping.")
         self.assertEqual(
             manifest["assets"],
@@ -94,6 +97,7 @@ class ChangelogScriptTests(unittest.TestCase):
             manifest,
             {
                 "version": "0.1.1",
+                "protocol": read_protocol_version(),
                 "notes": "### Fixed\n- One",
                 "assets": {
                     "linux-x86_64": "https://example.com/linux-x86_64",
@@ -136,6 +140,7 @@ class ChangelogScriptTests(unittest.TestCase):
             canonicalize_manifest(
                 {
                     "version": "0.1.1",
+                    "protocol": read_protocol_version(),
                     "notes": "### Fixed\n- One",
                     "assets": {
                         "linux-x86_64": "https://example.com/linux-x86_64",
@@ -149,6 +154,7 @@ class ChangelogScriptTests(unittest.TestCase):
     def test_ensure_manifest_matches_expected_normalizes_whitespace(self) -> None:
         actual = {
             "version": "v0.1.1",
+            "protocol": read_protocol_version(),
             "notes": "\n### Fixed\n- One\n",
             "assets": {
                 "linux-x86_64": " https://example.com/linux-x86_64 ",
@@ -159,6 +165,7 @@ class ChangelogScriptTests(unittest.TestCase):
         }
         expected = {
             "version": "0.1.1",
+            "protocol": read_protocol_version(),
             "notes": "### Fixed\n- One",
             "assets": {
                 "linux-x86_64": "https://example.com/linux-x86_64",
@@ -176,6 +183,7 @@ class ChangelogScriptTests(unittest.TestCase):
             ensure_manifest_matches_expected(
                 {
                     "version": "0.1.1",
+                    "protocol": read_protocol_version(),
                     "notes": "### Fixed\n- Different",
                     "assets": {
                         "linux-x86_64": "https://example.com/linux-x86_64",
@@ -186,6 +194,7 @@ class ChangelogScriptTests(unittest.TestCase):
                 },
                 {
                     "version": "0.1.1",
+                    "protocol": read_protocol_version(),
                     "notes": "### Fixed\n- One",
                     "assets": {
                         "linux-x86_64": "https://example.com/linux-x86_64",
@@ -196,6 +205,34 @@ class ChangelogScriptTests(unittest.TestCase):
                 },
                 "test manifest",
             )
+
+    def test_canonicalize_manifest_requires_protocol(self) -> None:
+        with self.assertRaisesRegex(ChangelogError, "missing an integer protocol"):
+            canonicalize_manifest(
+                {
+                    "version": "0.1.1",
+                    "notes": "### Fixed\n- One",
+                    "assets": default_release_assets("0.1.1"),
+                },
+                "test manifest",
+            )
+
+    def test_ensure_manifest_matches_expected_rejects_different_protocol(self) -> None:
+        actual = {
+            "version": "0.1.1",
+            "protocol": read_protocol_version() + 1,
+            "notes": "### Fixed\n- One",
+            "assets": default_release_assets("0.1.1"),
+        }
+        expected = {
+            "version": "0.1.1",
+            "protocol": read_protocol_version(),
+            "notes": "### Fixed\n- One",
+            "assets": default_release_assets("0.1.1"),
+        }
+
+        with self.assertRaisesRegex(ChangelogError, "does not match"):
+            ensure_manifest_matches_expected(actual, expected, "test manifest")
 
 
 if __name__ == "__main__":

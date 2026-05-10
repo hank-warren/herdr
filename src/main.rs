@@ -383,7 +383,11 @@ fn main() -> io::Result<()> {
     // Auto-detect launch: when --no-session is NOT set, use server/client mode.
     // Check if a server is running, spawn one if needed, then attach as client.
     if !no_session {
-        return server::autodetect::auto_detect_launch();
+        if let Err(err) = server::autodetect::auto_detect_launch() {
+            eprintln!("herdr: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     // --- Monolithic mode (--no-session escape hatch) ---
