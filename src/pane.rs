@@ -548,6 +548,7 @@ pub struct PaneRuntime {
     io: PaneRuntimeIo,
     current_size: Cell<(u16, u16, u32, u32)>,
     child_pid: Arc<AtomicU32>,
+    child_wait_completed: Option<Arc<AtomicBool>>,
     kitty_keyboard_flags: Arc<AtomicU16>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -692,18 +693,45 @@ impl Drop for PaneRuntime {
         self.detect_handle.abort();
         self.io.shutdown();
         if !self.preserve_processes_on_drop {
-            shutdown_pane_processes(self.pane_id, self.child_pid.load(Ordering::Acquire));
+            shutdown_pane_processes(
+                self.pane_id,
+                self.child_pid.load(Ordering::Acquire),
+                self.child_wait_completed.as_deref(),
+            );
         }
     }
 }
 
-fn wait_for_processes_to_exit(pids: &[u32], timeout: std::time::Duration) -> bool {
+fn process_alive_for_shutdown(
+    pid: u32,
+    child_pid: u32,
+    child_wait_completed: bool,
+    process_exists: impl FnOnce(u32) -> bool,
+) -> bool {
+    if pid == child_pid && child_wait_completed {
+        return false;
+    }
+    process_exists(pid)
+}
+
+fn wait_for_processes_to_exit(
+    pids: &[u32],
+    child_pid: u32,
+    child_wait_completed: Option<&AtomicBool>,
+    timeout: std::time::Duration,
+) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if pids
-            .iter()
-            .all(|pid| !crate::platform::process_exists(*pid))
-        {
+        let child_wait_completed =
+            child_wait_completed.is_some_and(|flag| flag.load(Ordering::Acquire));
+        if pids.iter().all(|pid| {
+            !process_alive_for_shutdown(
+                *pid,
+                child_pid,
+                child_wait_completed,
+                crate::platform::process_exists,
+            )
+        }) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -713,7 +741,11 @@ fn wait_for_processes_to_exit(pids: &[u32], timeout: std::time::Duration) -> boo
     }
 }
 
-fn shutdown_pane_processes(pane_id: PaneId, child_pid: u32) {
+fn shutdown_pane_processes(
+    pane_id: PaneId,
+    child_pid: u32,
+    child_wait_completed: Option<&AtomicBool>,
+) {
     if child_pid == 0 {
         return;
     }
@@ -740,7 +772,7 @@ fn shutdown_pane_processes(pane_id: PaneId, child_pid: u32) {
         ),
     ] {
         crate::platform::signal_processes(&pids, signal);
-        if wait_for_processes_to_exit(&pids, grace) {
+        if wait_for_processes_to_exit(&pids, child_pid, child_wait_completed, grace) {
             info!(
                 pane = pane_id.raw(),
                 pid = child_pid,
@@ -882,9 +914,15 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
 }
 
 impl PaneRuntime {
-    pub fn shutdown(self) {
+    pub fn shutdown(mut self) {
         self.detect_handle.abort();
-        shutdown_pane_processes(self.pane_id, self.child_pid.load(Ordering::Acquire));
+        self.io.shutdown();
+        shutdown_pane_processes(
+            self.pane_id,
+            self.child_pid.load(Ordering::Acquire),
+            self.child_wait_completed.as_deref(),
+        );
+        self.preserve_processes_on_drop = true;
     }
 
     #[cfg(unix)]
@@ -1270,6 +1308,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, cell_width_px, cell_height_px)),
             child_pid,
+            child_wait_completed: None,
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
@@ -1314,8 +1353,10 @@ impl PaneRuntime {
 
         // --- Child watcher task ---
         let child_pid = Arc::new(AtomicU32::new(0));
+        let child_wait_completed = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
+            let child_wait_completed = child_wait_completed.clone();
             let events = events.clone();
             let rt = tokio::runtime::Handle::current();
             let mut child = spawned.child;
@@ -1331,6 +1372,7 @@ impl PaneRuntime {
                     }
                     Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
                 }
+                child_wait_completed.store(true, Ordering::Release);
                 // Use blocking send — PaneDied is critical, must not be dropped
                 if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
@@ -1677,6 +1719,7 @@ impl PaneRuntime {
             io,
             current_size: Cell::new((rows, cols, 0, 0)),
             child_pid,
+            child_wait_completed: Some(child_wait_completed),
             kitty_keyboard_flags,
             detect_reset_notify,
             pending_release,
@@ -2010,6 +2053,7 @@ impl PaneRuntime {
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
+                child_wait_completed: None,
                 kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -2024,6 +2068,26 @@ impl PaneRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_liveness_treats_reaped_direct_child_as_gone() {
+        assert!(!process_alive_for_shutdown(42, 42, true, |_| true));
+    }
+
+    #[test]
+    fn shutdown_liveness_keeps_unreaped_direct_child_alive() {
+        assert!(process_alive_for_shutdown(42, 42, false, |_| true));
+    }
+
+    #[test]
+    fn shutdown_liveness_keeps_other_session_processes_alive() {
+        assert!(process_alive_for_shutdown(43, 42, true, |_| true));
+    }
+
+    #[test]
+    fn shutdown_liveness_treats_missing_process_as_gone() {
+        assert!(!process_alive_for_shutdown(43, 42, false, |_| false));
+    }
 
     fn capture_shell_output(command: &str, extra_env: &[(&str, &str)]) -> String {
         let pair = native_pty_system()
@@ -2424,6 +2488,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -2451,6 +2516,7 @@ mod tests {
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
+            child_wait_completed: None,
             kitty_keyboard_flags: Arc::new(AtomicU16::new(0)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
