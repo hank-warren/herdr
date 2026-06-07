@@ -238,6 +238,10 @@ impl TerminalRuntime {
         self.0.cursor_state(area, show_cursor)
     }
 
+    pub fn synchronized_output_active(&self) -> bool {
+        self.0.synchronized_output_active()
+    }
+
     pub fn visible_text(&self) -> String {
         self.0.visible_text()
     }

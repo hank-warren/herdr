@@ -1421,18 +1421,10 @@ impl AppState {
 
     pub(crate) fn pane_exposes_host_cursor(
         &self,
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
+        _ws_idx: usize,
+        _pane_id: crate::layout::PaneId,
     ) -> bool {
-        let has_effective_agent_label = self
-            .workspaces
-            .get(ws_idx)
-            .and_then(|ws| ws.terminal_id(pane_id))
-            .and_then(|terminal_id| self.terminals.get(terminal_id))
-            .and_then(crate::terminal::TerminalState::effective_agent_label)
-            .is_some();
-
-        pane_exposes_host_cursor_for_target(has_effective_agent_label, cfg!(windows))
+        true
     }
 
     pub(crate) fn integration_updates_available(&self) -> bool {
@@ -1750,28 +1742,31 @@ impl AppState {
     }
 }
 
-fn pane_exposes_host_cursor_for_target(
-    has_effective_agent_label: bool,
-    target_is_windows: bool,
-) -> bool {
-    !target_is_windows || !has_effective_agent_label
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
 
     #[test]
-    fn windows_agent_panes_do_not_expose_host_cursor() {
-        assert!(!pane_exposes_host_cursor_for_target(true, true));
-        assert!(pane_exposes_host_cursor_for_target(false, true));
-    }
+    fn agent_terminal_keeps_final_child_cursor_exposed() {
+        let mut state = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        state.terminals.insert(
+            ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+            crate::terminal::TerminalState::new(
+                ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+                std::path::PathBuf::from("/tmp"),
+            ),
+        );
+        state
+            .terminals
+            .get_mut(&ws.tabs[0].panes[&pane_id].attached_terminal_id)
+            .expect("terminal state")
+            .launch_argv = Some(vec!["codex".to_string()]);
+        state.workspaces = vec![ws];
 
-    #[test]
-    fn non_windows_agent_panes_keep_existing_host_cursor_behavior() {
-        assert!(pane_exposes_host_cursor_for_target(true, false));
-        assert!(pane_exposes_host_cursor_for_target(false, false));
+        assert!(state.pane_exposes_host_cursor(0, pane_id));
     }
 
     #[test]

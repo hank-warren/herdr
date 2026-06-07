@@ -1047,6 +1047,7 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
     pane_shell_command_builder_for_target(shell_config, cfg!(target_os = "macos"))
 }
 
+#[cfg(windows)]
 fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
     if !is_windows_powershell_shell(shell) {
         return;
@@ -1056,26 +1057,25 @@ fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str)
     cmd.arg(windows_powershell_cwd_prompt_wrapper());
 }
 
-fn is_windows_powershell_shell(shell: &str) -> bool {
-    #[cfg(windows)]
-    {
-        let name = Path::new(shell)
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or(shell)
-            .to_ascii_lowercase();
-        matches!(
-            name.as_str(),
-            "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = shell;
-        false
-    }
+#[cfg(not(windows))]
+fn apply_windows_powershell_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
+    let _ = (cmd, shell);
 }
 
+#[cfg(windows)]
+fn is_windows_powershell_shell(shell: &str) -> bool {
+    let name = Path::new(shell)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
+    )
+}
+
+#[cfg(windows)]
 fn windows_powershell_cwd_prompt_wrapper() -> &'static str {
     r#"$global:__HERDR_ORIGINAL_PROMPT = if (Test-Path Function:\prompt) { (Get-Command prompt -CommandType Function).ScriptBlock } else { { "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) " } }; function global:prompt { try { if ($PWD.Provider.Name -eq 'FileSystem') { $uri = ([System.Uri]$PWD.ProviderPath).AbsoluteUri; [Console]::Write("$([char]27)]7;$uri$([char]7)") } } catch {}; & $global:__HERDR_ORIGINAL_PROMPT }"#
 }
@@ -2002,6 +2002,10 @@ impl PaneRuntime {
             visible: cursor.visible,
             shape: cursor.shape,
         })
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.terminal.synchronized_output_active()
     }
 
     pub fn visible_text(&self) -> String {

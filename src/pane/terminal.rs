@@ -187,6 +187,10 @@ impl PaneTerminal {
         self.ghostty.cursor_state()
     }
 
+    pub fn synchronized_output_active(&self) -> bool {
+        self.ghostty.synchronized_output_active()
+    }
+
     pub fn visible_text(&self) -> String {
         self.ghostty.visible_text()
     }
@@ -887,6 +891,18 @@ impl GhosttyPaneTerminal {
             visible: render_state.cursor_visible().ok()?,
             shape,
         })
+    }
+
+    pub fn synchronized_output_active(&self) -> bool {
+        self.core
+            .lock()
+            .ok()
+            .and_then(|core| {
+                core.terminal
+                    .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+                    .ok()
+            })
+            .unwrap_or(false)
     }
 
     pub fn encode_terminal_key(

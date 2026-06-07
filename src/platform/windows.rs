@@ -84,21 +84,73 @@ fn select_pane_foreground_job(
 
     let descendants = descendant_entries(shell_pid, entries);
     let mut candidates = Vec::new();
-    for entry in descendants {
+    for entry in &descendants {
         let process = foreground_process_from_entry(entry);
         let job = ForegroundJob {
             process_group_id: entry.pid,
             processes: vec![process],
         };
-        if crate::detect::identify_agent_in_job(&job).is_some() {
-            candidates.push(job);
+        if let Some((agent, _)) = crate::detect::identify_agent_in_job(&job) {
+            candidates.push((*entry, agent));
         }
     }
 
     match candidates.len() {
-        1 => candidates.pop(),
-        _ => Some(shell_job()),
+        1 => candidates
+            .pop()
+            .map(|(entry, _)| foreground_job_from_entry(entry)),
+        _ => select_single_agent_chain_candidate(&candidates, entries).map_or_else(
+            || Some(shell_job()),
+            |entry| Some(foreground_job_from_entry(entry)),
+        ),
     }
+}
+
+fn foreground_job_from_entry(entry: &WindowsProcessEntry) -> ForegroundJob {
+    ForegroundJob {
+        process_group_id: entry.pid,
+        processes: vec![foreground_process_from_entry(entry)],
+    }
+}
+
+fn select_single_agent_chain_candidate<'a>(
+    candidates: &[(&'a WindowsProcessEntry, crate::detect::Agent)],
+    entries: &[WindowsProcessEntry],
+) -> Option<&'a WindowsProcessEntry> {
+    let (_, first_agent) = candidates.first()?;
+    if !candidates.iter().all(|(_, agent)| agent == first_agent) {
+        return None;
+    }
+
+    let parent_by_pid: HashMap<u32, u32> = entries
+        .iter()
+        .map(|entry| (entry.pid, entry.parent_pid))
+        .collect();
+
+    candidates.iter().map(|(entry, _)| *entry).find(|entry| {
+        candidates.iter().all(|(other, _)| {
+            entry.pid == other.pid || process_is_ancestor(entry.pid, other.pid, &parent_by_pid)
+        })
+    })
+}
+
+fn process_is_ancestor(
+    ancestor_pid: u32,
+    descendant_pid: u32,
+    parent_by_pid: &HashMap<u32, u32>,
+) -> bool {
+    let mut current = descendant_pid;
+    while let Some(parent) = parent_by_pid.get(&current).copied() {
+        if parent == ancestor_pid {
+            return true;
+        }
+        if parent == 0 || parent == current {
+            return false;
+        }
+        current = parent;
+    }
+
+    false
 }
 
 fn descendant_entries(root_pid: u32, entries: &[WindowsProcessEntry]) -> Vec<&WindowsProcessEntry> {
@@ -530,6 +582,68 @@ mod tests {
 
         assert_eq!(job.process_group_id, 20);
         assert_eq!(job.processes[0].name, "cmd.exe");
+    }
+
+    #[test]
+    fn windows_process_tree_selects_topmost_codex_process_in_single_agent_chain() {
+        let entries = vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(
+                20,
+                10,
+                "node.exe",
+                &[
+                    "node.exe",
+                    "C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
+                ],
+            ),
+            test_entry(
+                30,
+                20,
+                "codex.exe",
+                &["C:\\Users\\herdr\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe"],
+            ),
+            test_entry(40, 30, "node_repl.exe", &["node_repl.exe"]),
+            test_entry(
+                50,
+                40,
+                "codex.exe",
+                &["codex.exe", "app-server", "--listen", "stdio://"],
+            ),
+        ];
+
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+
+        assert_eq!(job.process_group_id, 20);
+        assert_eq!(job.processes[0].name, "node.exe");
+    }
+
+    #[test]
+    fn windows_process_tree_selects_topmost_claude_process_in_single_agent_chain() {
+        let entries = vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "claude.exe", &["claude.exe"]),
+            test_entry(30, 20, "claude.exe", &["claude.exe", "mcp-server"]),
+        ];
+
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+
+        assert_eq!(job.process_group_id, 20);
+        assert_eq!(job.processes[0].name, "claude.exe");
+    }
+
+    #[test]
+    fn windows_process_tree_returns_shell_for_same_agent_siblings() {
+        let entries = vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            test_entry(30, 10, "codex.exe", &["codex.exe"]),
+        ];
+
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+
+        assert_eq!(job.process_group_id, 10);
+        assert_eq!(job.processes[0].name, "powershell.exe");
     }
 
     #[test]

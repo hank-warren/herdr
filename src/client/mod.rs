@@ -19,6 +19,8 @@ use std::io::{self, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -68,11 +70,20 @@ struct ClientState {
     mouse_scroll_lines: usize,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
+    #[cfg(windows)]
+    pending_cursor_reveal: Option<PendingCursorReveal>,
 }
 
 #[derive(Debug, Default)]
 #[cfg(windows)]
 struct AttachEscapeState;
+
+#[derive(Debug)]
+#[cfg(windows)]
+struct PendingCursorReveal {
+    due_at: Instant,
+    bytes: Vec<u8>,
+}
 
 #[derive(Debug, Default)]
 #[cfg(unix)]
@@ -201,6 +212,37 @@ fn attach_scroll_action(
 impl ClientState {
     fn request_full_redraw(&mut self) {
         self.blit_encoder = render_ansi::BlitEncoder::new();
+        #[cfg(windows)]
+        {
+            self.pending_cursor_reveal = None;
+        }
+    }
+
+    #[cfg(windows)]
+    fn update_pending_cursor_reveal(&mut self, reveal: Option<Vec<u8>>) {
+        const CURSOR_REVEAL_DEBOUNCE: Duration = Duration::from_millis(90);
+        self.pending_cursor_reveal = reveal.map(|bytes| PendingCursorReveal {
+            due_at: Instant::now() + CURSOR_REVEAL_DEBOUNCE,
+            bytes,
+        });
+    }
+
+    #[cfg(windows)]
+    fn flush_pending_cursor_reveal_if_due(&mut self) {
+        let Some(pending) = &self.pending_cursor_reveal else {
+            return;
+        };
+        if pending.due_at > Instant::now() {
+            return;
+        }
+
+        let pending = self
+            .pending_cursor_reveal
+            .take()
+            .expect("pending cursor reveal");
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(&pending.bytes);
+        let _ = stdout.flush();
     }
 }
 
@@ -771,6 +813,8 @@ async fn run_client_loop(
         #[cfg(unix)]
         mouse_scroll_lines,
         redraw_on_focus_gained,
+        #[cfg(windows)]
+        pending_cursor_reveal: None,
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -942,7 +986,14 @@ async fn run_client_loop(
             }
             ClientLoopEvent::ServerMessage(msg) => match msg {
                 ServerMessage::Frame(frame_data) => {
+                    #[cfg(windows)]
+                    let encoded = state
+                        .blit_encoder
+                        .encode_with_deferred_cursor_reveal(&frame_data, false);
+                    #[cfg(not(windows))]
                     let encoded = state.blit_encoder.encode(&frame_data, false);
+                    #[cfg(windows)]
+                    let deferred_cursor_reveal = encoded.deferred_cursor_reveal.clone();
                     let mut stdout = io::stdout();
                     let graphics = if state.kitty_graphics_enabled {
                         frame_data.graphics.as_slice()
@@ -953,6 +1004,8 @@ async fn run_client_loop(
                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                     let _ = stdout.flush();
                     state.blit_encoder.commit(frame_data, encoded);
+                    #[cfg(windows)]
+                    state.update_pending_cursor_reveal(deferred_cursor_reveal);
                 }
                 ServerMessage::Terminal(frame) => {
                     if state.kitty_graphics_enabled && contains_kitty_graphics_bytes(&frame.bytes) {
@@ -1008,7 +1061,8 @@ async fn run_client_loop(
                 )));
             }
             ClientLoopEvent::Timer => {
-                // Check if we should quit.
+                #[cfg(windows)]
+                state.flush_pending_cursor_reveal_if_due();
             }
         }
     }

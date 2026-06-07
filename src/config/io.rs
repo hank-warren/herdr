@@ -14,30 +14,20 @@ pub fn app_dir_name() -> &'static str {
 
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join(app_dir_name())
-    } else if cfg!(windows) {
-        windows_config_dir()
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
-    } else {
-        std::env::temp_dir().join(app_dir_name())
+        return PathBuf::from(dir).join(app_dir_name());
     }
+    platform_config_dir()
 }
 
 pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(dir).join(app_dir_name())
-    } else if cfg!(windows) {
-        windows_state_dir()
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
-    } else {
-        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+        return PathBuf::from(dir).join(app_dir_name());
     }
+    platform_state_dir()
 }
 
 #[cfg(windows)]
-fn windows_config_dir() -> PathBuf {
+fn platform_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("APPDATA") {
         return PathBuf::from(dir).join(app_dir_name());
     }
@@ -54,12 +44,16 @@ fn windows_config_dir() -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn windows_config_dir() -> PathBuf {
-    unreachable!("windows_config_dir is only called on Windows")
+fn platform_config_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
+    } else {
+        std::env::temp_dir().join(app_dir_name())
+    }
 }
 
 #[cfg(windows)]
-fn windows_state_dir() -> PathBuf {
+fn platform_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LOCALAPPDATA") {
         return PathBuf::from(dir).join(app_dir_name());
     }
@@ -76,8 +70,12 @@ fn windows_state_dir() -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn windows_state_dir() -> PathBuf {
-    unreachable!("windows_state_dir is only called on Windows")
+fn platform_state_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
+    } else {
+        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+    }
 }
 
 impl Config {

@@ -11,8 +11,10 @@
 //!    `CUP` positions during the frame stream.
 //! 5. After writing all changed cells, restore the final cursor visibility
 //!    and position from `frame.cursor`.
-//! 6. After ending synchronized output, repeat the final cursor anchor so
-//!    external IMEs can place candidate windows at the real input position.
+//! 6. On platforms that need it, repeat the final cursor anchor after ending
+//!    synchronized output so external IMEs can place candidate windows at the
+//!    real input position. Windows Terminal exposes that repeat as visible
+//!    cursor movement during active TUI repaints, so Windows skips it.
 //!
 //! Escape sequences used:
 //! - `CSI H` (CUP) — move cursor to (row, col)
@@ -37,6 +39,9 @@ pub(crate) struct EncodedBlit {
     pub(crate) bytes: Vec<u8>,
     /// Whether this frame was encoded as a full redraw.
     pub(crate) full: bool,
+    /// Cursor reveal bytes to write after a short quiet period.
+    #[cfg(any(windows, test))]
+    pub(crate) deferred_cursor_reveal: Option<Vec<u8>>,
     next_last_visible_cursor: Option<(u16, u16)>,
     next_last_cursor_shape: u8,
 }
@@ -55,6 +60,24 @@ impl BlitEncoder {
     }
 
     pub(crate) fn encode(&self, frame: &FrameData, force_full: bool) -> EncodedBlit {
+        self.encode_inner(frame, force_full, false)
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn encode_with_deferred_cursor_reveal(
+        &self,
+        frame: &FrameData,
+        force_full: bool,
+    ) -> EncodedBlit {
+        self.encode_inner(frame, force_full, true)
+    }
+
+    fn encode_inner(
+        &self,
+        frame: &FrameData,
+        force_full: bool,
+        defer_visible_cursor_during_content_changes: bool,
+    ) -> EncodedBlit {
         let prev = if force_full {
             None
         } else {
@@ -69,12 +92,19 @@ impl BlitEncoder {
         let mut bytes = Vec::new();
         let mut next_last_visible_cursor = self.last_visible_cursor;
         let mut next_last_cursor_shape = self.last_cursor_shape;
+        let suppress_visible_cursor = defer_visible_cursor_during_content_changes
+            && should_defer_visible_cursor(frame, prev, full);
+        #[cfg(any(windows, test))]
+        let deferred_cursor_reveal = suppress_visible_cursor
+            .then(|| encode_visible_cursor_reveal(frame))
+            .flatten();
         blit_frame_to_with_cursor_memory(
             &mut bytes,
             frame,
             prev,
             &mut next_last_visible_cursor,
             &mut next_last_cursor_shape,
+            suppress_visible_cursor,
         );
         if let Some(stats) = prof_stats {
             crate::render_prof::duration_since("ansi_encode.total", prof_started);
@@ -91,6 +121,8 @@ impl BlitEncoder {
         EncodedBlit {
             bytes,
             full,
+            #[cfg(any(windows, test))]
+            deferred_cursor_reveal,
             next_last_visible_cursor,
             next_last_cursor_shape,
         }
@@ -351,6 +383,7 @@ fn blit_frame_to(writer: impl Write, frame: &FrameData, prev: Option<&FrameData>
         prev,
         &mut last_visible_cursor,
         &mut last_cursor_shape,
+        false,
     );
 }
 
@@ -360,19 +393,42 @@ fn blit_frame_to_with_cursor_memory(
     prev: Option<&FrameData>,
     last_visible_cursor: &mut Option<(u16, u16)>,
     last_cursor_shape: &mut u8,
+    suppress_visible_cursor: bool,
+) {
+    blit_frame_to_with_cursor_memory_and_policy(
+        &mut writer,
+        frame,
+        prev,
+        last_visible_cursor,
+        last_cursor_shape,
+        repeat_ime_anchor_after_sync(),
+        suppress_visible_cursor,
+    );
+}
+
+fn blit_frame_to_with_cursor_memory_and_policy(
+    mut writer: impl Write,
+    frame: &FrameData,
+    prev: Option<&FrameData>,
+    last_visible_cursor: &mut Option<(u16, u16)>,
+    last_cursor_shape: &mut u8,
+    repeat_ime_anchor: bool,
+    suppress_visible_cursor: bool,
 ) {
     // On first frame or size change, do a full redraw.
     let full_redraw =
         prev.is_none() || prev.is_some_and(|p| p.width != frame.width || p.height != frame.height);
 
+    // Hide cursor before any cell writes to avoid stray cursor artifacts
+    // on terminals that render the hardware cursor at intermediate CUP positions.
+    // Keep this outside synchronized output so terminals that defer sync-block
+    // side effects still hide the cursor before frame painting begins.
+    let _ = writer.write_all(b"\x1b[?25l");
+
     // Ask terminals that support synchronized output to apply the whole frame
     // atomically. This keeps IMEs and cursor trackers from observing the
     // intermediate CUP positions used while painting changed cells.
     let _ = writer.write_all(b"\x1b[?2026h");
-
-    // Hide cursor before any cell writes to avoid stray cursor artifacts
-    // on terminals that render the hardware cursor at intermediate CUP positions.
-    let _ = writer.write_all(b"\x1b[?25l");
 
     // Start each frame from a known OSC 8 state. If a previous write was
     // interrupted or the outer terminal had an active hyperlink, unlinked cells
@@ -395,7 +451,10 @@ fn blit_frame_to_with_cursor_memory(
     // cell rather than the focused pane's input position. When the focused pane
     // hides its cursor, still park the host cursor intentionally so IMEs do not
     // anchor to whichever cell happened to be painted last.
-    let host_cursor = resolve_host_cursor_state(frame, last_visible_cursor);
+    let mut host_cursor = resolve_host_cursor_state(frame, last_visible_cursor);
+    if suppress_visible_cursor && host_cursor.visible {
+        host_cursor.visible = false;
+    }
     write_host_cursor_state(&mut writer, host_cursor, last_cursor_shape);
 
     // End the synchronized output block immediately after the final cursor
@@ -404,11 +463,38 @@ fn blit_frame_to_with_cursor_memory(
 
     // Some native IMEs track candidate-window placement from normal terminal
     // cursor updates and may not observe cursor moves emitted inside synchronized
-    // output. Re-emit only the resolved final cursor anchor after the sync block;
-    // intermediate paint cursor positions remain hidden and the focused pane's
-    // requested cursor visibility is preserved.
-    write_ime_anchor_cursor_state(&mut writer, host_cursor);
+    // output. Re-emit only the resolved final cursor anchor after the sync block
+    // on targets that need it; Windows Terminal exposes that repeat as cursor
+    // movement during active TUI repaints.
+    if repeat_ime_anchor {
+        write_ime_anchor_cursor_state(&mut writer, host_cursor);
+    }
     let _ = writer.flush();
+}
+
+#[cfg(windows)]
+fn repeat_ime_anchor_after_sync() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+fn repeat_ime_anchor_after_sync() -> bool {
+    true
+}
+
+fn should_defer_visible_cursor(frame: &FrameData, prev: Option<&FrameData>, full: bool) -> bool {
+    let cursor_changed = prev.is_some_and(|prev| prev.cursor != frame.cursor);
+    frame_has_cell_changes(frame, prev, full) || cursor_changed
+}
+
+fn frame_has_cell_changes(frame: &FrameData, prev: Option<&FrameData>, full: bool) -> bool {
+    if full {
+        return true;
+    }
+    let Some(prev) = prev else {
+        return true;
+    };
+    compute_prof_blit_stats(frame, Some(prev), false).changed_cells > 0
 }
 
 /// Writes all cells in the frame (full redraw).
@@ -505,6 +591,22 @@ fn write_ime_anchor_cursor_state(writer: &mut impl Write, cursor: HostCursorStat
     } else {
         let _ = writer.write_all(b"\x1b[?25l");
     }
+}
+
+#[cfg(any(windows, test))]
+fn encode_visible_cursor_reveal(frame: &FrameData) -> Option<Vec<u8>> {
+    let cursor = frame.cursor.as_ref()?;
+    if !cursor.visible {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let position = clamp_cursor_position(frame, cursor.x, cursor.y);
+    write_cursor_position(&mut bytes, position);
+    let shape = normalize_cursor_shape(cursor.shape);
+    let _ = write!(bytes, "\x1b[{} q", shape);
+    let _ = bytes.write_all(b"\x1b[?25h");
+    Some(bytes)
 }
 
 fn write_all_cells(writer: &mut impl Write, frame: &FrameData) {
@@ -835,8 +937,8 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.starts_with("\x1b[?2026h\x1b[?25l"),
-            "should begin synchronized output and hide cursor before any cell writes during full redraw"
+            output_str.starts_with("\x1b[?25l\x1b[?2026h"),
+            "should hide cursor before synchronized frame painting during full redraw"
         );
     }
 
@@ -869,8 +971,8 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.starts_with("\x1b[?2026h\x1b[?25l"),
-            "should begin synchronized output and hide cursor before any cell writes during diff"
+            output_str.starts_with("\x1b[?25l\x1b[?2026h"),
+            "should hide cursor before synchronized frame painting during diff"
         );
     }
 
@@ -883,20 +985,20 @@ mod tests {
 
         let output_str = String::from_utf8(output).unwrap();
         assert!(
-            output_str.starts_with("\x1b[?2026h"),
+            output_str.starts_with("\x1b[?25l\x1b[?2026h"),
             "should begin synchronized output before frame writes"
         );
         let sync_end = output_str
             .find("\x1b[?2026l")
             .expect("should end synchronized output after frame writes");
         assert!(
-            sync_end + "\x1b[?2026l".len() < output_str.len(),
-            "should end synchronized output before trailing IME cursor update"
+            sync_end > 0,
+            "should end synchronized output after frame writes"
         );
     }
 
     #[test]
-    fn blit_frame_repeats_final_cursor_state_after_synchronized_output() {
+    fn blit_frame_can_repeat_final_cursor_state_after_synchronized_output() {
         let frame = FrameData {
             cells: vec![make_cell("A", 0, 0, 0); 9],
             width: 3,
@@ -911,8 +1013,18 @@ mod tests {
             graphics: Vec::new(),
         };
 
+        let mut last_visible_cursor = None;
+        let mut last_cursor_shape = 0;
         let mut output = Vec::new();
-        blit_frame_to(&mut output, &frame, None);
+        blit_frame_to_with_cursor_memory_and_policy(
+            &mut output,
+            &frame,
+            None,
+            &mut last_visible_cursor,
+            &mut last_cursor_shape,
+            true,
+            false,
+        );
 
         let output_str = String::from_utf8(output).unwrap();
         let sync_end = output_str
@@ -922,6 +1034,115 @@ mod tests {
         assert_eq!(
             trailing_cursor, "\x1b[2;3H\x1b[?25h",
             "should expose only the final cursor state after synchronized output"
+        );
+    }
+
+    #[test]
+    fn blit_frame_can_skip_final_cursor_state_after_synchronized_output() {
+        let frame = FrameData {
+            cells: vec![make_cell("A", 0, 0, 0); 9],
+            width: 3,
+            height: 3,
+            cursor: Some(CursorState {
+                x: 2,
+                y: 1,
+                visible: true,
+                shape: 0,
+            }),
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+
+        let mut last_visible_cursor = None;
+        let mut last_cursor_shape = 0;
+        let mut output = Vec::new();
+        blit_frame_to_with_cursor_memory_and_policy(
+            &mut output,
+            &frame,
+            None,
+            &mut last_visible_cursor,
+            &mut last_cursor_shape,
+            false,
+            false,
+        );
+
+        let output_str = String::from_utf8(output).unwrap();
+        let sync_end = output_str
+            .find("\x1b[?2026l")
+            .expect("should end synchronized output");
+        let trailing_cursor = &output_str[sync_end + "\x1b[?2026l".len()..];
+        assert_eq!(
+            trailing_cursor, "",
+            "should not expose a post-sync cursor repeat when the target terminal flickers on it"
+        );
+    }
+
+    #[test]
+    fn blit_encoder_can_defer_visible_cursor_reveal_for_content_changes() {
+        let frame = FrameData {
+            cells: vec![make_cell("A", 0, 0, 0); 9],
+            width: 3,
+            height: 3,
+            cursor: Some(CursorState {
+                x: 2,
+                y: 1,
+                visible: true,
+                shape: 6,
+            }),
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let encoder = BlitEncoder::new();
+
+        let encoded = encoder.encode_with_deferred_cursor_reveal(&frame, false);
+
+        let output_str = String::from_utf8(encoded.bytes).unwrap();
+        assert!(
+            !output_str.contains("\x1b[?25h"),
+            "active repaint should keep the native cursor hidden"
+        );
+        assert_eq!(
+            encoded.deferred_cursor_reveal.as_deref(),
+            Some(&b"\x1b[2;3H\x1b[6 q\x1b[?25h"[..])
+        );
+    }
+
+    #[test]
+    fn blit_encoder_can_defer_visible_cursor_reveal_for_cursor_only_changes() {
+        let prev = FrameData {
+            cells: vec![make_cell("A", 0, 0, 0); 9],
+            width: 3,
+            height: 3,
+            cursor: Some(CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+                shape: 0,
+            }),
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        };
+        let mut curr = prev.clone();
+        curr.cursor = Some(CursorState {
+            x: 2,
+            y: 1,
+            visible: true,
+            shape: 0,
+        });
+        let mut encoder = BlitEncoder::new();
+        let first = encoder.encode(&prev, false);
+        encoder.commit(prev, first);
+
+        let encoded = encoder.encode_with_deferred_cursor_reveal(&curr, false);
+
+        let output_str = String::from_utf8(encoded.bytes).unwrap();
+        assert!(
+            !output_str.contains("\x1b[?25h"),
+            "cursor-only movement should remain hidden until the debounce fires"
+        );
+        assert_eq!(
+            encoded.deferred_cursor_reveal.as_deref(),
+            Some(&b"\x1b[2;3H\x1b[0 q\x1b[?25h"[..])
         );
     }
 
@@ -941,8 +1162,18 @@ mod tests {
             graphics: Vec::new(),
         };
 
+        let mut last_visible_cursor = None;
+        let mut last_cursor_shape = 0;
         let mut output = Vec::new();
-        blit_frame_to(&mut output, &frame, None);
+        blit_frame_to_with_cursor_memory_and_policy(
+            &mut output,
+            &frame,
+            None,
+            &mut last_visible_cursor,
+            &mut last_cursor_shape,
+            true,
+            false,
+        );
 
         let output_str = String::from_utf8(output).unwrap();
         let final_cursor = output_str
@@ -994,20 +1225,24 @@ mod tests {
         let mut last_cursor_shape = 0;
         let mut output = Vec::new();
 
-        blit_frame_to_with_cursor_memory(
+        blit_frame_to_with_cursor_memory_and_policy(
             &mut output,
             &visible,
             None,
             &mut last_visible_cursor,
             &mut last_cursor_shape,
+            true,
+            false,
         );
         output.clear();
-        blit_frame_to_with_cursor_memory(
+        blit_frame_to_with_cursor_memory_and_policy(
             &mut output,
             &hidden,
             Some(&visible),
             &mut last_visible_cursor,
             &mut last_cursor_shape,
+            true,
+            false,
         );
 
         let output_str = String::from_utf8(output).unwrap();
@@ -1337,6 +1572,7 @@ mod tests {
             None,
             &mut last_visible_cursor,
             &mut last_cursor_shape,
+            false,
         );
         output.clear();
         blit_frame_to_with_cursor_memory(
@@ -1345,6 +1581,7 @@ mod tests {
             Some(&visible),
             &mut last_visible_cursor,
             &mut last_cursor_shape,
+            false,
         );
 
         let output_str = String::from_utf8(output).unwrap();
@@ -1377,6 +1614,7 @@ mod tests {
             None,
             &mut last_visible_cursor,
             &mut last_cursor_shape,
+            false,
         );
 
         let output_str = String::from_utf8(output).unwrap();

@@ -4869,6 +4869,70 @@ next_tab = ""
     }
 
     #[tokio::test]
+    async fn virtual_render_hides_focused_pane_cursor_during_synchronized_output() {
+        let mut state = AppState::test_new();
+        state.reveal_hidden_cursor_for_cjk_ime = true;
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left");
+        ws.insert_test_runtime(pane_id, runtime);
+
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let _ = crate::server::render_stream::render_virtual(&mut state, area, true);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let runtime = state
+            .runtime_for_pane(&terminal_runtimes, pane_id)
+            .expect("pane runtime after initial render");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+
+        let (_buffer, cursor) =
+            crate::server::render_stream::render_virtual(&mut state, area, false);
+
+        assert_eq!(
+            cursor, None,
+            "child cursor positions are unstable while synchronized output is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_render_hides_focused_pane_cursor_during_synchronized_output_resize() {
+        let mut state = AppState::test_new();
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"left");
+        ws.insert_test_runtime(pane_id, runtime);
+
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = crate::app::Mode::Terminal;
+
+        let initial_area = Rect::new(0, 0, 80, 24);
+        let _ = crate::server::render_stream::render_virtual(&mut state, initial_area, true);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        let runtime = state
+            .runtime_for_pane(&terminal_runtimes, pane_id)
+            .expect("pane runtime after initial render");
+        runtime.test_process_pty_bytes(b"\x1b[?2026h\x1b[2;3H");
+        assert!(runtime.synchronized_output_active());
+
+        let resized_area = Rect::new(0, 0, 100, 30);
+        let (_buffer, cursor) =
+            crate::server::render_stream::render_virtual(&mut state, resized_area, true);
+
+        assert_eq!(
+            cursor, None,
+            "pre-resize synchronized output should suppress the cursor even if resize clears the mode"
+        );
+    }
+
+    #[tokio::test]
     async fn virtual_render_exposes_hidden_pane_cursor_when_reveal_hidden_for_cjk_ime() {
         let mut state = AppState::test_new();
         state.reveal_hidden_cursor_for_cjk_ime = true;
