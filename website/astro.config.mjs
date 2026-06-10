@@ -104,6 +104,7 @@ export default defineConfig({
           items: [
             { label: 'Overview', slug: 'docs' },
             { label: 'Install', slug: 'docs/install' },
+            { label: 'Windows beta', slug: 'docs/windows-beta' },
             { label: 'Quick start', slug: 'docs/quick-start' },
             { label: 'How to work with Herdr', slug: 'docs/how-to-work' },
             { label: 'Concepts', slug: 'docs/concepts' },
