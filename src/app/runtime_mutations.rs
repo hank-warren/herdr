@@ -1,4 +1,8 @@
-use crate::api::schema::{Method, PaneTarget, TabTarget, WorkspaceTarget};
+use crate::api::schema::{
+    LayoutSetSplitRatioParams, Method, PaneFocusDirectionParams, PaneRenameParams,
+    PaneResizeParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomParams, TabTarget,
+    WorkspaceTarget,
+};
 
 use super::App;
 
@@ -45,5 +49,53 @@ impl App {
 
     pub(crate) fn runtime_pane_close(&mut self, id: &'static str, pane_id: String) -> String {
         self.dispatch_runtime_mutation(id, Method::PaneClose(PaneTarget { pane_id }))
+    }
+
+    pub(crate) fn runtime_pane_rename(
+        &mut self,
+        id: &'static str,
+        params: PaneRenameParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneRename(params))
+    }
+
+    pub(crate) fn runtime_pane_focus_direction(
+        &mut self,
+        id: &'static str,
+        params: PaneFocusDirectionParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneFocusDirection(params))
+    }
+
+    pub(crate) fn runtime_pane_resize(
+        &mut self,
+        id: &'static str,
+        params: PaneResizeParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneResize(params))
+    }
+
+    pub(crate) fn runtime_pane_swap(&mut self, id: &'static str, params: PaneSwapParams) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneSwap(params))
+    }
+
+    pub(crate) fn runtime_pane_split(
+        &mut self,
+        id: &'static str,
+        params: PaneSplitParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneSplit(params))
+    }
+
+    pub(crate) fn runtime_pane_zoom(&mut self, id: &'static str, params: PaneZoomParams) -> String {
+        self.dispatch_runtime_mutation(id, Method::PaneZoom(params))
+    }
+
+    pub(crate) fn runtime_layout_set_split_ratio(
+        &mut self,
+        id: &'static str,
+        params: LayoutSetSplitRatioParams,
+    ) -> String {
+        self.dispatch_runtime_mutation(id, Method::LayoutSetSplitRatio(params))
     }
 }
