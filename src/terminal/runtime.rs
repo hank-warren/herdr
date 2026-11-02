@@ -594,6 +594,44 @@ impl TerminalRuntime {
         self.0.child_pid()
     }
 
+    /// herdr-core terminal address when this pane's program runs in hc.
+    pub(crate) fn hc_terminal(&self) -> Option<String> {
+        #[cfg(unix)]
+        return self.0.hc_terminal();
+        #[cfg(not(unix))]
+        None
+    }
+
+    #[cfg(unix)]
+    // Mirrors spawn_with_initial_history's runtime wiring.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_hc_terminal(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        hc_terminal: &str,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
+        crate::pane::PaneRuntime::attach_hc_terminal(
+            pane_id,
+            rows,
+            cols,
+            hc_terminal,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            events,
+            render_notify,
+            render_dirty,
+        )
+        .map(Self)
+    }
+
     pub(crate) fn current_size(&self) -> (u16, u16) {
         self.0.current_size()
     }

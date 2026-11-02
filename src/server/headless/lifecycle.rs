@@ -82,6 +82,10 @@ impl HeadlessServer {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
                 continue;
             };
+            // No fd to pass: the snapshot carries its hc address and the new server reattaches.
+            if runtime.hc_terminal().is_some() {
+                continue;
+            }
             let mut handoff_runtime = runtime.handoff_runtime_state(pane_id);
             handoff_runtime.agent_state = self
                 .app

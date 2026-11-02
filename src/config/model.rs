@@ -1115,6 +1115,17 @@ pub struct ExperimentalConfig {
     /// elsewhere and a best-effort no-op if the switch fails.
     /// Default: false.
     pub switch_ascii_input_source_in_prefix: bool,
+    /// Where pane programs run: "pty" (local PTY) or "hc" (herdr-core
+    /// terminals, which outlive the herdr server). Unix only. Default: "pty".
+    pub pane_backend: PaneBackend,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneBackend {
+    #[default]
+    Pty,
+    Hc,
 }
 
 impl Default for KeysConfig {
