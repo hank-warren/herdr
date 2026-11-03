@@ -111,6 +111,9 @@ pub struct PaneSnapshot {
     pub agent_resume: Option<PaneAgentResumeSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_argv: Option<Vec<String>>,
+    /// herdr-core terminal address the pane's program lives in; restore reattaches to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hc_terminal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +391,9 @@ fn capture_tab(
                 agent_session,
                 agent_resume,
                 launch_argv,
+                hc_terminal: terminal_id
+                    .and_then(|id| terminal_runtimes.get(id))
+                    .and_then(|runtime| runtime.hc_terminal()),
             },
         );
     }
@@ -707,6 +713,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                hc_terminal: None,
             },
         );
         panes.insert(
@@ -719,6 +726,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                hc_terminal: None,
             },
         );
 
@@ -1405,6 +1413,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                hc_terminal: None,
             },
         );
         panes.insert(
@@ -1419,6 +1428,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                hc_terminal: None,
             },
         );
 
@@ -1462,5 +1472,21 @@ mod tests {
             restored.workspaces[0].tabs[0].panes[&0].cwd,
             PathBuf::from("/tmp/this-directory-does-not-exist-for-herdr-test")
         );
+    }
+
+    #[test]
+    fn pane_hc_terminal_is_optional_and_omitted_for_pty_panes() {
+        let legacy: PaneSnapshot = serde_json::from_str(r#"{"cwd":"/tmp"}"#).unwrap();
+        assert_eq!(legacy.hc_terminal, None);
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("hc_terminal"));
+
+        let hc: PaneSnapshot =
+            serde_json::from_str(r#"{"cwd":"/tmp","hc_terminal":"t7"}"#).unwrap();
+        assert_eq!(hc.hc_terminal.as_deref(), Some("t7"));
+        assert!(serde_json::to_string(&hc)
+            .unwrap()
+            .contains(r#""hc_terminal":"t7""#));
     }
 }

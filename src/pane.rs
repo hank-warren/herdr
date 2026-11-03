@@ -230,6 +230,9 @@ struct SpawnInitialState<'a> {
     detected_agent: Option<Agent>,
     history_ansi: Option<&'a str>,
     windows_powershell_prompt_cwd_reporting: bool,
+    /// Attach to this live herdr-core terminal instead of starting a program.
+    #[cfg(unix)]
+    hc_terminal: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1523,6 +1526,9 @@ pub struct PaneRuntime {
 
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
+    /// The program runs in a herdr-core terminal; this is our attach stream.
+    #[cfg(unix)]
+    Hc(crate::hc::HcPaneIo),
     #[cfg(test)]
     TestChannel {
         sender: mpsc::Sender<Bytes>,
@@ -1534,8 +1540,18 @@ impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(hc) => hc.shutdown(),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
+        }
+    }
+
+    #[cfg(unix)]
+    fn hc_terminal(&self) -> Option<&str> {
+        match self {
+            PaneRuntimeIo::Hc(hc) => Some(hc.terminal()),
+            _ => None,
         }
     }
 
@@ -1543,6 +1559,10 @@ impl PaneRuntimeIo {
     fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.duplicate_for_handoff(),
+            PaneRuntimeIo::Hc(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "herdr-core panes have no PTY fd to hand off",
+            )),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
@@ -1554,6 +1574,7 @@ impl PaneRuntimeIo {
     fn foreground_process_group_id(&self) -> Option<u32> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id(),
+            PaneRuntimeIo::Hc(hc) => hc.foreground_process_group_id(),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => None,
         }
@@ -1563,6 +1584,7 @@ impl PaneRuntimeIo {
     fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1578,6 +1600,7 @@ impl PaneRuntimeIo {
                     actor.rollback_handoff()
                 }
             }
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1587,6 +1610,7 @@ impl PaneRuntimeIo {
     fn release_after_commit(&self) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.release_after_commit(),
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1603,6 +1627,16 @@ impl PaneRuntimeIo {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 actor.resize(
+                    rows,
+                    cols,
+                    cell_width_px,
+                    cell_height_px,
+                    terminal_responses,
+                );
+            }
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(hc) => {
+                hc.resize(
                     rows,
                     cols,
                     cell_width_px,
@@ -1629,6 +1663,7 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => {
                 actor.nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
             }
+            PaneRuntimeIo::Hc(_) => {}
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
         }
@@ -1637,6 +1672,8 @@ impl PaneRuntimeIo {
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(hc) => hc.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
@@ -1645,6 +1682,8 @@ impl PaneRuntimeIo {
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_terminal_response(response),
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(hc) => hc.write_terminal_response(response),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 if let Some(bytes) = response() {
@@ -1671,6 +1710,8 @@ impl PaneRuntimeIo {
                     actor.queue_user_input_submission(text, enter, delay)
                 }
             }
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(hc) => hc.queue_user_input_submission(text, enter, delay, deadline),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 let _ = deadline;
@@ -1708,6 +1749,12 @@ impl Drop for PaneRuntime {
         }
         self.compression.abort();
         self.io.shutdown();
+        // Dropping (server exit, handoff) only detaches: the program lives on in
+        // herdr-core. Closing a pane ends it through PaneRuntime::shutdown.
+        #[cfg(unix)]
+        if self.io.hc_terminal().is_some() {
+            return;
+        }
         if !self.preserve_processes_on_drop {
             shutdown_pane_processes(
                 self.pane_id,
@@ -1715,6 +1762,97 @@ impl Drop for PaneRuntime {
                 self.child_wait_completed.as_deref(),
             );
         }
+    }
+}
+
+enum StartedPaneProgram {
+    Pty(crate::pty::backend::SpawnedPty),
+    #[cfg(unix)]
+    Hc(crate::hc::RunTerminal),
+}
+
+enum PaneIoSource {
+    #[cfg(unix)]
+    Pty(std::os::fd::OwnedFd),
+    #[cfg(windows)]
+    Pty(Box<dyn portable_pty::MasterPty + Send>),
+    #[cfg(unix)]
+    Hc(crate::hc::RunTerminal),
+}
+
+fn start_pane_program(
+    pane_id: PaneId,
+    rows: u16,
+    cols: u16,
+    cmd: CommandBuilder,
+    existing_hc_terminal: Option<&str>,
+) -> std::io::Result<StartedPaneProgram> {
+    #[cfg(unix)]
+    if let Some(address) = existing_hc_terminal {
+        debug!(pane = pane_id.raw(), terminal = %address, "reattaching pane to herdr-core terminal");
+        return Ok(StartedPaneProgram::Hc(crate::hc::RunTerminal {
+            address: address.to_string(),
+            pid: None,
+        }));
+    }
+    #[cfg(not(unix))]
+    let _ = existing_hc_terminal;
+    #[cfg(unix)]
+    if crate::hc::pane_backend_enabled() {
+        let mut labels = vec![(
+            crate::hc::OWNER_LABEL,
+            crate::session::active_name().unwrap_or_else(|| "default".into()),
+        )];
+        if let Some(public_id) = cmd.get_env(crate::integration::HERDR_PANE_ID_ENV_VAR) {
+            labels.push((
+                crate::hc::PANE_LABEL,
+                public_id.to_string_lossy().into_owned(),
+            ));
+        }
+        let run = crate::hc::run_terminal(&cmd, &labels)?;
+        debug!(pane = pane_id.raw(), terminal = %run.address, "pane program started in herdr-core");
+        return Ok(StartedPaneProgram::Hc(run));
+    }
+    let _ = pane_id;
+    crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd).map(StartedPaneProgram::Pty)
+}
+
+/// Turns the end of an hc stream into the same `PaneDied` the PTY child watcher sends.
+#[cfg(unix)]
+fn hc_stream_end_handler(
+    pane_id: PaneId,
+    events: &mpsc::Sender<AppEvent>,
+    child_wait_completed: &Arc<AtomicBool>,
+) -> impl FnOnce(crate::hc::HcStreamEnd) + Send + 'static {
+    let events = events.clone();
+    let child_wait_completed = child_wait_completed.clone();
+    move |end: crate::hc::HcStreamEnd| {
+        let exit_reason = if end.program_ended() {
+            crate::platform::ChildExitReason::Exited
+        } else {
+            crate::platform::ChildExitReason::Interrupted
+        };
+        crate::logging::pane_exited(pane_id.raw(), &format!("{end:?}"));
+        child_wait_completed.store(true, Ordering::Release);
+        // Runs on the hc reader thread, never inside the runtime.
+        if let Err(err) = events.blocking_send(AppEvent::PaneDied {
+            pane_id,
+            exit_reason,
+        }) {
+            error!(pane = pane_id.raw(), err = %err, "failed to send PaneDied event");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn kill_hc_terminal(pane_id: PaneId, terminal: String) {
+    let spawned = crate::thread_spawn::spawn_named("hc-kill", move || {
+        if let Err(err) = crate::hc::kill_terminal(&terminal) {
+            warn!(pane = pane_id.raw(), %terminal, err = %err, "failed to end herdr-core terminal");
+        }
+    });
+    if let Err(err) = spawned {
+        warn!(pane = pane_id.raw(), err = %err, "failed to spawn herdr-core kill thread");
     }
 }
 
@@ -2237,12 +2375,17 @@ impl PaneRuntime {
         }
         self.compression.abort();
         self.io.shutdown();
+        self.preserve_processes_on_drop = true;
+        #[cfg(unix)]
+        if let Some(terminal) = self.io.hc_terminal() {
+            kill_hc_terminal(self.pane_id, terminal.to_string());
+            return;
+        }
         shutdown_pane_processes(
             self.pane_id,
             self.child_pid.load(Ordering::Acquire),
             self.child_wait_completed.as_deref(),
         );
-        self.preserve_processes_on_drop = true;
     }
 
     #[cfg(unix)]
@@ -2369,6 +2512,47 @@ impl PaneRuntime {
         )
     }
 
+    /// Rebuilds a pane around a herdr-core terminal that outlived the previous server.
+    #[cfg(unix)]
+    // Runtime construction needs to thread PTY size, environment, theme, and render hooks together.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach_hc_terminal(
+        pane_id: PaneId,
+        rows: u16,
+        cols: u16,
+        hc_terminal: &str,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_command_builder(
+            pane_id,
+            rows,
+            cols,
+            scrollback_limit_bytes,
+            host_terminal_theme,
+            host_terminal_appearance,
+            events,
+            render_notify,
+            render_dirty,
+            CommandBuilder::new_default_prog(),
+            "failed to reattach herdr-core terminal",
+            SpawnInitialState {
+                hc_terminal: Some(hc_terminal),
+                ..SpawnInitialState::default()
+            },
+            AgentDetection::Enabled,
+        )
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn hc_terminal(&self) -> Option<String> {
+        self.io.hc_terminal().map(str::to_string)
+    }
+
     // Runtime construction needs to thread PTY size, environment, theme, and render hooks together.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_with_initial_history(
@@ -2408,6 +2592,7 @@ impl PaneRuntime {
                 detected_agent: None,
                 history_ansi: initial_history_ansi,
                 windows_powershell_prompt_cwd_reporting,
+                ..SpawnInitialState::default()
             },
             AgentDetection::Enabled,
         )
@@ -2723,7 +2908,11 @@ impl PaneRuntime {
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
 
-        let spawned = crate::pty::backend::spawn_with_portable_pty(rows, cols, cmd)
+        #[cfg(unix)]
+        let existing_hc_terminal = initial_state.hc_terminal;
+        #[cfg(not(unix))]
+        let existing_hc_terminal: Option<&str> = None;
+        let started = start_pane_program(pane_id, rows, cols, cmd, existing_hc_terminal)
             .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?;
 
         // --- Child watcher task ---
@@ -2734,39 +2923,58 @@ impl PaneRuntime {
         let detection_content_seq = Arc::new(AtomicU64::new(0));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         let self_reported_agent_active = Arc::new(AtomicBool::new(false));
-        {
-            let child_pid = child_pid.clone();
-            let child_wait_completed = child_wait_completed.clone();
-            let events = events.clone();
-            let rt = tokio::runtime::Handle::current();
-            let mut child = spawned.child;
-            if let Some(pid) = child.process_id() {
-                child_pid.store(pid, Ordering::Release);
-                crate::logging::pane_spawned(pane_id.raw(), pid);
-            }
-            tokio::task::spawn_blocking(move || {
-                let exit_reason = match child.wait() {
-                    Ok(status) => {
-                        let exit_reason = crate::platform::classify_child_exit(&status);
-                        let status_text = format!("{status:?}");
-                        crate::logging::pane_exited(pane_id.raw(), &status_text);
-                        exit_reason
-                    }
-                    Err(e) => {
-                        crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
-                        crate::platform::ChildExitReason::WaitFailed
-                    }
-                };
-                child_wait_completed.store(true, Ordering::Release);
-                // Use blocking send — PaneDied is critical, must not be dropped
-                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
-                    pane_id,
-                    exit_reason,
-                })) {
-                    error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+        let io_source = match started {
+            #[cfg(unix)]
+            StartedPaneProgram::Hc(run) => {
+                if let Some(pid) = run.pid {
+                    child_pid.store(pid, Ordering::Release);
+                    crate::logging::pane_spawned(pane_id.raw(), pid);
                 }
-            });
-        }
+                PaneIoSource::Hc(run)
+            }
+            StartedPaneProgram::Pty(spawned) => {
+                let child_pid = child_pid.clone();
+                let child_wait_completed = child_wait_completed.clone();
+                let events = events.clone();
+                let rt = tokio::runtime::Handle::current();
+                let mut child = spawned.child;
+                if let Some(pid) = child.process_id() {
+                    child_pid.store(pid, Ordering::Release);
+                    crate::logging::pane_spawned(pane_id.raw(), pid);
+                }
+                tokio::task::spawn_blocking(move || {
+                    let exit_reason = match child.wait() {
+                        Ok(status) => {
+                            let exit_reason = crate::platform::classify_child_exit(&status);
+                            let status_text = format!("{status:?}");
+                            crate::logging::pane_exited(pane_id.raw(), &status_text);
+                            exit_reason
+                        }
+                        Err(e) => {
+                            crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string());
+                            crate::platform::ChildExitReason::WaitFailed
+                        }
+                    };
+                    child_wait_completed.store(true, Ordering::Release);
+                    // Use blocking send — PaneDied is critical, must not be dropped
+                    if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied {
+                        pane_id,
+                        exit_reason,
+                    })) {
+                        error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
+                    }
+                });
+                #[cfg(unix)]
+                let master = spawned.master_fd;
+                #[cfg(windows)]
+                let master = spawned.master;
+                PaneIoSource::Pty(master)
+            }
+        };
+        #[cfg(unix)]
+        let on_hc_end = hc_stream_end_handler(pane_id, &events, &child_wait_completed);
+        #[cfg(unix)]
+        let hc_child_pid = child_pid.clone();
 
         let io = {
             let terminal = terminal.clone();
@@ -2829,16 +3037,43 @@ impl PaneRuntime {
                     terminal_responses: result.terminal_responses,
                 }
             });
-            PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
-                pane_id: pane_id.raw(),
+            match io_source {
+                PaneIoSource::Pty(master) => {
+                    PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
+                        pane_id: pane_id.raw(),
+                        #[cfg(unix)]
+                        master_fd: master,
+                        #[cfg(windows)]
+                        master,
+                        initially_quiesced: false,
+                        on_read,
+                        on_reader_exit: None,
+                    })?)
+                }
                 #[cfg(unix)]
-                master_fd: spawned.master_fd,
-                #[cfg(windows)]
-                master: spawned.master,
-                initially_quiesced: false,
-                on_read,
-                on_reader_exit: None,
-            })?)
+                PaneIoSource::Hc(run) => {
+                    let (hc, attached) = crate::hc::HcPaneIo::spawn(crate::hc::HcPaneIoConfig {
+                        pane_id: pane_id.raw(),
+                        attach: crate::hc::HcAttach {
+                            terminal: run.address,
+                            rows,
+                            cols,
+                            history: 0,
+                        },
+                        on_read,
+                        on_end: Box::new(on_hc_end),
+                    })
+                    .inspect_err(
+                        |err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"),
+                    )?;
+                    if run.pid.is_none() {
+                        if let Some(pid) = attached.pid {
+                            hc_child_pid.store(pid, Ordering::Release);
+                        }
+                    }
+                    PaneRuntimeIo::Hc(hc)
+                }
+            }
         };
 
         // --- Detection task ---
@@ -3684,6 +3919,8 @@ impl PaneRuntime {
                 let _ = bytes;
                 Ok(())
             }
+            #[cfg(unix)]
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }

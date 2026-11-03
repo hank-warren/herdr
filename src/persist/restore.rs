@@ -520,7 +520,17 @@ fn restore_tab(
 
         let cwd = saved_cwd;
         let has_import = old_id.is_some_and(|old_id| imported_panes.contains_key(old_id));
-        if !has_import && !cwd.is_dir() {
+        #[cfg(unix)]
+        let live_hc_terminal = if has_import {
+            None
+        } else {
+            saved_pane
+                .and_then(|pane| pane.hc_terminal.as_deref())
+                .filter(|address| crate::hc::terminal_is_live(address))
+        };
+        #[cfg(not(unix))]
+        let live_hc_terminal: Option<&str> = None;
+        if !has_import && live_hc_terminal.is_none() && !cwd.is_dir() {
             let terminal = unavailable_restored_terminal(
                 saved_pane,
                 cwd,
@@ -584,7 +594,8 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
-        let pending_native_agent_restore = if was_imported {
+        // A live hc terminal still runs the agent: reattach instead of resuming it.
+        let pending_native_agent_restore = if was_imported || live_hc_terminal.is_some() {
             None
         } else {
             startup.restore_plan.clone()
@@ -633,7 +644,20 @@ fn restore_tab(
 
         let runtime_result = {
             #[cfg(unix)]
-            if let Some(imported) = imported_runtime {
+            if let Some(address) = live_hc_terminal {
+                TerminalRuntime::attach_hc_terminal(
+                    *id,
+                    rows,
+                    cols,
+                    address,
+                    runtime_context.scrollback_limit_bytes,
+                    crate::terminal_theme::TerminalTheme::default(),
+                    None,
+                    runtime_context.events.clone(),
+                    runtime_context.render_notify.clone(),
+                    runtime_context.render_dirty.clone(),
+                )
+            } else if let Some(imported) = imported_runtime {
                 TerminalRuntime::from_handoff_fd(
                     crate::handoff_runtime::ImportedHandoffRuntime {
                         master_fd: imported.master_fd,
@@ -688,7 +712,9 @@ fn restore_tab(
             Ok(runtime) => {
                 let terminal_id = TerminalId::alloc();
                 let mut terminal = TerminalState::new(terminal_id.clone(), cwd.clone());
-                if was_imported {
+                // The same program kept running, so its identity carries over.
+                let program_survived = was_imported || live_hc_terminal.is_some();
+                if program_survived {
                     if let Some(argv) = saved_launch_argv {
                         terminal = terminal.with_launch_argv(argv).with_respawn_shell_on_exit();
                     }
@@ -703,11 +729,13 @@ fn restore_tab(
                     terminal.restore_reported_resume(resume);
                 }
                 match (saved_agent_name, saved_managed_agent) {
-                    (Some(agent_name), Some(agent)) if was_imported => {
+                    (Some(agent_name), Some(agent)) if program_survived => {
                         terminal.restore_managed_agent(agent_name, agent)
                     }
                     (Some(_), Some(_)) => {}
-                    (Some(agent_name), None) if was_imported => terminal.set_agent_name(agent_name),
+                    (Some(agent_name), None) if program_survived => {
+                        terminal.set_agent_name(agent_name)
+                    }
                     (Some(_), None) => {}
                     (None, _) => {}
                 }
@@ -1554,6 +1582,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            hc_terminal: None,
                         },
                     )]),
                     zoomed: false,
@@ -1636,6 +1665,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                hc_terminal: None,
                             },
                         ),
                         (
@@ -1648,6 +1678,7 @@ mod tests {
                                 agent_session: None,
                                 agent_resume: None,
                                 launch_argv: None,
+                                hc_terminal: None,
                             },
                         ),
                     ]),
@@ -1702,6 +1733,7 @@ mod tests {
                     agent_session: None,
                     agent_resume: None,
                     launch_argv: None,
+                    hc_terminal: None,
                 },
             )
         };
@@ -1718,6 +1750,7 @@ mod tests {
             }),
             agent_resume: None,
             launch_argv: None,
+            hc_terminal: None,
         };
         let snapshot = SessionSnapshot {
             version: super::super::snapshot::SNAPSHOT_VERSION,
@@ -1870,6 +1903,7 @@ mod tests {
                             }),
                             agent_resume: None,
                             launch_argv: None,
+                            hc_terminal: None,
                         },
                     )]),
                     zoomed: false,
@@ -2176,6 +2210,7 @@ mod tests {
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
+                hc_terminal: None,
             },
         );
         let mut history = SessionHistorySnapshot {

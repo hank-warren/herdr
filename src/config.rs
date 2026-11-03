@@ -51,7 +51,10 @@ pub(crate) use self::{
     window_title::{sanitize_window_title_text, window_title_diagnostics},
 };
 
-pub(crate) use self::{keybinds::CommandKeybindType, model::KeysConfig};
+pub(crate) use self::{
+    keybinds::CommandKeybindType,
+    model::{KeysConfig, PaneBackend},
+};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
 
